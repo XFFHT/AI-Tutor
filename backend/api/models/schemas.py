@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Any
 from datetime import datetime
 
 class FileUploadResponse(BaseModel):
@@ -49,7 +49,7 @@ class DeepSeekResultResponse(BaseModel):
     result_file: Optional[str]
     questions_count: int
     json_content: Optional[List[dict]]
-    data: Optional[List[dict]]
+    data: Optional[Any]
 
 class PPTGenerateRequest(BaseModel):
     json_file_path: str
