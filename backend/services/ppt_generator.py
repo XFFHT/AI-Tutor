@@ -1,497 +1,800 @@
-import json
-import re
+from __future__ import annotations
+
 import os
+import re
+import unicodedata
+import hashlib
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+
+from PIL import Image, ImageDraw, ImageFont
+from matplotlib import font_manager
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
-from pptx.oxml.ns import qn
-from lxml import etree
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt
 
 try:
     import win32com.client
+
     HAS_WIN32COM = True
 except ImportError:
     HAS_WIN32COM = False
 
 from services.latex_renderer import latex_renderer
+from utils.config import TEMP_DIR
 
-LATEX_MAP = {
-    '\\lceil': '⌈', '\\rceil': '⌉', '\\lfloor': '⌊', '\\rfloor': '⌋',
-    '\\log': 'log', '\\infty': '∞', '\\pi': 'π', '\\times': '×',
-    '\\div': '÷', '\\leq': '≤', '\\geq': '≥', '\\neq': '≠',
-    '\\approx': '≈', '\\pm': '±', '\\cdot': '·', '\\{': '{', '\\}': '}',
-    '\\alpha': 'α', '\\beta': 'β', '\\gamma': 'γ', '\\delta': 'δ',
-    '\\epsilon': 'ε', '\\theta': 'θ', '\\lambda': 'λ', '\\mu': 'μ',
-    '\\sigma': 'σ', '\\omega': 'ω', '\\Delta': 'Δ', '\\Sigma': 'Σ',
-    '\\Omega': 'Ω', '\\rightarrow': '→', '\\leftarrow': '←',
-    '\\Rightarrow': '⇒', '\\Leftarrow': '⇐', '\\Leftrightarrow': '⇔',
-    '\\equiv': '≡', '\\sim': '∼', '\\propto': '∝', '\\subset': '⊂',
-    '\\supset': '⊃', '\\in': '∈', '\\ni': '∋', '\\notin': '∉',
-    '\\cup': '∪', '\\cap': '∩', '\\emptyset': '∅', '\\forall': '∀',
-    '\\exists': '∃', '\\nabla': '∇', '\\partial': '∂', '\\sum': '∑',
-    '\\prod': '∏', '\\int': '∫', '\\oint': '∮', '\\sqrt': '√',
-    '\\angle': '∠', '\\circ': '∘', '\\bullet': '∙', '\\ast': '∗'
-}
+
+OPTION_PATTERN = re.compile(r"^\s*([A-H])[\.．、\)\]）]\s*(.*)$")
+INLINE_MATH_PATTERN = re.compile(r"(?<!\\)\$(.*?)(?<!\\)\$", re.DOTALL)
+EMU_PER_INCH = 914400
+PIL_DPI = 96
+
+COLOR_TITLE = (31, 91, 166)
+COLOR_TEXT = (34, 34, 34)
+COLOR_MUTED = (106, 119, 138)
+COLOR_ANSWER = (20, 135, 84)
+BLOCK_CACHE_VERSION = "v4-formula-size"
+
+
+@dataclass
+class InlineItem:
+    kind: Literal["text", "formula"]
+    content: str
+    width: float
+    height: float
+    image_path: str | None = None
+
+
+@dataclass
+class LineLayout:
+    items: list[InlineItem] = field(default_factory=list)
+    width: float = 0.0
+    height: float = 0.0
+
+
+@dataclass
+class FontProfile:
+    stem: int
+    option: int
+    answer: int
+    analysis: int
+
+
+@dataclass
+class BlockRender:
+    path: str
+    width: float
+    height: float
 
 
 class PPTGenerator:
-    def __init__(self):
-        self.latex_map = LATEX_MAP
+    def __init__(self) -> None:
+        self.slide_width_inches = 13.333
+        self.slide_height_inches = 7.5
+        self.page_left = 0.7
+        self.page_right = 0.7
+        self.content_width = self.slide_width_inches - self.page_left - self.page_right
+        self.block_cache_dir = TEMP_DIR / "ppt_block_cache"
+        self.block_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def clean_latex(self, text: str) -> str:
-        for k, v in self.latex_map.items():
-            text = text.replace(k, v)
-        return text
+    def _inches(self, emu_value: int) -> float:
+        return emu_value / EMU_PER_INCH
+
+    def _normalize_text(self, text: str) -> str:
+        text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\u3000", " ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def contains_latex(self, text: str) -> bool:
-        """检测文本是否包含 LaTeX 公式（$...$ 包裹）"""
-        return '$' in text
+        return bool(INLINE_MATH_PATTERN.search(text or ""))
 
-    def parse_latex_segments(self, text: str) -> list[tuple[Literal['text', 'latex'], str]]:
-        """
-        解析文本为片段列表
-
-        Returns:
-            [('text', '普通文本'), ('latex', '公式内容'), ...]
-        """
-        segments = []
-        # 转义 \$ 情况先处理
-        text = text.replace('\\$', '\x00')
-
-        # 匹配 $...$ 包裹的 LaTeX
-        pattern = re.compile(r'\$([^\$]+)\$')
+    def split_inline_segments(self, text: str) -> list[tuple[Literal["text", "latex"], str]]:
+        text = text or ""
+        segments: list[tuple[Literal["text", "latex"], str]] = []
         last_end = 0
 
-        for match in pattern.finditer(text):
+        for match in INLINE_MATH_PATTERN.finditer(text):
             start = match.start()
             if start > last_end:
-                plain = text[last_end:start].replace('\x00', '$')
+                plain = text[last_end:start]
                 if plain:
-                    segments.append(('text', plain))
+                    segments.append(("text", plain))
 
-            latex_content = match.group(1)
-            segments.append(('latex', latex_content))
+            formula = match.group(1)
+            if formula:
+                segments.append(("latex", formula.strip()))
             last_end = match.end()
 
         if last_end < len(text):
-            plain = text[last_end:].replace('\x00', '$')
-            if plain:
-                segments.append(('text', plain))
+            tail = text[last_end:]
+            if tail:
+                segments.append(("text", tail))
 
         return segments
 
-    def calculate_content_fit(
-        self,
-        question_text: str,
-        options: list,
-        analysis: str,
-        content_width: Inches,
-        available_height: Inches
-    ) -> dict:
-        """
-        计算内容是否适合幻灯片，返回推荐的字体大小和布局参数
-        """
-        # 初始字体大小
-        title_font_size = 22
-        option_font_size = 20
-        analysis_font_size = 18
-
-        # 检查是否包含 LaTeX
-        has_latex_question = self.contains_latex(question_text)
-        has_latex_analysis = self.contains_latex(analysis)
-
-        # 估算各部分内容高度
-        def estimate_total_height(q_font, o_font, a_font):
-            height = Inches(0.8)  # 标题高度
-
-            # 题目高度 - 考虑 LaTeX
-            if has_latex_question:
-                # LaTeX 公式通常需要更多空间
-                q_height = self.estimate_text_height(question_text, content_width, q_font)
-                # 有 LaTeX 时增加额外空间
-                q_height = q_height * 1.3
-                if options:
-                    q_height = min(q_height, Inches(2.0))  # 有选项时限制高度
-                else:
-                    q_height = min(q_height, Inches(4.0))  # 无选项时可以更高
-            else:
-                q_height = self.estimate_text_height(question_text, content_width, q_font)
-                if options:
-                    q_height = min(q_height, Inches(1.5))  # 有选项时限制高度
-                else:
-                    q_height = min(q_height, Inches(3.5))  # 无选项时可以更高
-            height += q_height + Inches(0.2)
-
-            # 选项高度
-            if options:
-                # 选项数量不同，高度也不同
-                num_options = len(options)
-                option_height = Inches(0.45 * ((num_options + 1) // 2))  # 每对选项0.45英寸
-                height += min(option_height, Inches(2.0))  # 最大2英寸
-
-            # 答案高度
-            height += Inches(0.4) + Inches(0.1)
-
-            # 解析高度 - 考虑 LaTeX
-            if has_latex_analysis:
-                # LaTeX 公式需要更多空间
-                a_height = self.estimate_text_height('【解析】 ' + analysis, content_width, a_font)
-                a_height = a_height * 1.3  # 增加额外空间
-                height += min(a_height, Inches(2.5))  # 最大2.5英寸
-            else:
-                a_height = self.estimate_text_height('【解析】 ' + analysis, content_width, a_font)
-                height += min(a_height, Inches(2.0))  # 最大2英寸
-
-            return height
-
-        # 检查是否需要缩小字体
-        total_height = estimate_total_height(title_font_size, option_font_size, analysis_font_size)
-
-        # 如果内容超出，逐步缩小字体
-        min_title_font = 12
-        min_analysis_font = 10
-        
-        while total_height > available_height and (
-            title_font_size > min_title_font or 
-            analysis_font_size > min_analysis_font
-        ):
-            # 优先缩小解析字体
-            if analysis_font_size > min_analysis_font:
-                analysis_font_size -= 1
-            # 然后缩小标题字体
-            elif title_font_size > min_title_font:
-                title_font_size -= 1
-                option_font_size = max(14, title_font_size - 2)
-
-            total_height = estimate_total_height(title_font_size, option_font_size, analysis_font_size)
-
-        return {
-            'title_font_size': title_font_size,
-            'option_font_size': option_font_size,
-            'analysis_font_size': analysis_font_size,
-            'fits': total_height <= available_height,
-            'estimated_height': total_height,
-            'has_latex_question': has_latex_question,
-            'has_latex_analysis': has_latex_analysis
-        }
-
-    def estimate_text_height(self, text: str, width: Inches, font_size: int) -> Inches:
-        """
-        估算文本所需的高度
-        基于字符数和字体大小进行估算
-        """
-        if not text:
-            return Inches(0.3)
-
-        # 估算每行可容纳的字符数（基于字体大小和宽度）
-        avg_char_width = font_size * 0.015  # 英寸/字符
-        chars_per_line = int(width / Inches(avg_char_width))
-        chars_per_line = max(chars_per_line, 20)  # 最少每行20个字符
-
-        # 计算需要的行数
-        text_length = len(text)
-        num_lines = max(1, (text_length + chars_per_line - 1) // chars_per_line)
-
-        # 每行高度（根据字体大小）
-        line_height = font_size * 0.025  # 英寸
-        total_height = num_lines * line_height + 0.1  # 添加一些padding
-
-        return Inches(total_height)
-
-    def add_mixed_content_to_slide(
-        self,
-        slide,
-        segments: list[tuple[Literal['text', 'latex'], str]],
-        x: Inches,
-        y: Inches,
-        width: Inches,
-        height: Inches,
-        font_size: int = 20,
-        font_bold: bool = False,
-    ) -> int:
-        """
-        向 slide 添加混合内容（文本 + LaTeX 图片）
-
-        Returns:
-            使用的 y 位置（用于连续添加内容）
-        """
-        from PIL import Image as PILImage
-
-        current_y = y
-        # 根据字体大小自适应行高
-        line_height = Inches(font_size * 0.035)
-        # 根据字体大小自适应公式图片高度
-        base_font_size = 20
-        base_img_height = Inches(0.5)
-        max_img_height = base_img_height * (font_size / base_font_size) * 1.2
-        max_img_width = width
-
-        for seg_type, seg_content in segments:
-            if seg_type == 'text':
-                # 清理 LaTeX 字符映射
-                clean_text = self.clean_latex(seg_content)
-
-                if not clean_text.strip():
-                    continue
-
-                # 估算文本高度
-                est_height = self.estimate_text_height(clean_text, width, font_size)
-
-                # 添加文本框
-                text_box = slide.shapes.add_textbox(x, current_y, width, est_height)
-                tf = text_box.text_frame
-                tf.word_wrap = True
-                tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-                p = tf.paragraphs[0]
-                p.text = clean_text
-                p.font.size = Pt(font_size)
-                p.font.bold = font_bold
-                p.font.name = 'Microsoft YaHei'
-                p.alignment = PP_ALIGN.LEFT
-
-                current_y += est_height + Inches(0.05)
-
-            else:  # latex
-                # 渲染 LaTeX 为图片
-                img_path = latex_renderer.render_to_image(seg_content)
-
-                # 获取图片原始尺寸，保持宽高比
-                with PILImage.open(img_path) as img:
-                    img_w, img_h = img.size
-
-                # 计算缩放后的尺寸（保持宽高比）
-                aspect_ratio = img_w / img_h
-                # 根据字体大小计算合适的显示宽度
-                display_width = min(max_img_width, Inches(6.0))
-                display_height = display_width / aspect_ratio
-
-                # 如果计算的高度超过最大高度，则按高度缩放
-                if display_height > max_img_height:
-                    display_height = max_img_height
-                    display_width = display_height * aspect_ratio
-
-                # 如果宽度超过最大宽度，则按宽度缩放
-                if display_width > max_img_width:
-                    display_width = max_img_width
-                    display_height = display_width / aspect_ratio
-
-                # 添加图片到幻灯片
-                pic = slide.shapes.add_picture(img_path, x, current_y, width=display_width)
-                current_y += display_height + Inches(0.1)
-
-        return current_y
-
-    def add_math_text(self, paragraph, text: str):
-        """保留原有方法用于简单文本（无 $...$）"""
-        text = text.replace('$$', '$')
-        parts = re.split(r'\$(.*?)\$', text)
-        for i, part in enumerate(parts):
-            if not part:
-                continue
-            run = paragraph.add_run()
-            if i % 2 == 1:
-                # 如果包含复杂 LaTeX，使用清理后的简单版本
-                run.text = self.clean_latex(part)
-                run.font.name = 'Times New Roman'
-                run.font.italic = True
-            else:
-                run.text = self.clean_latex(part)
-                run.font.name = 'Microsoft YaHei'
-
-    def parse_options(self, content: str) -> list:
-        option_pattern = re.compile(r'^\s*([A-D])[)）\.\]]\s*(.*)$', re.MULTILINE)
-        matches = option_pattern.findall(content)
-        options = []
-        if matches:
-            for letter, text in matches:
-                options.append((letter, text.strip()))
-        return options
-
-    def create_title_slide(self, prs, main_title: str, subtitle_text: str):
-        slide_layout = prs.slide_layouts[6]
-        slide = prs.slides.add_slide(slide_layout)
-
-        title_box = slide.shapes.add_textbox(Inches(0), Inches(2.5), prs.slide_width, Inches(1.2))
-        p = title_box.text_frame.paragraphs[0]
-        p.text = main_title
-        p.font.size = Pt(54)
-        p.font.bold = True
-        p.font.name = 'Microsoft YaHei'
-        p.font.color.rgb = RGBColor(0, 112, 192)
-        p.alignment = PP_ALIGN.CENTER
-
-        subtitle_box = slide.shapes.add_textbox(Inches(0), Inches(4.0), prs.slide_width, Inches(0.8))
-        p2 = subtitle_box.text_frame.paragraphs[0]
-        p2.text = subtitle_text
-        p2.font.size = Pt(28)
-        p2.font.name = 'Microsoft YaHei'
-        p2.font.color.rgb = RGBColor(100, 100, 100)
-        p2.alignment = PP_ALIGN.CENTER
-
-    def create_question_slide(self, prs, question_num: int, content: str, source: str, answer: str, analysis: str):
-        slide_layout = prs.slide_layouts[6]
-        slide = prs.slides.add_slide(slide_layout)
-
-        # 幻灯片尺寸
-        slide_width = prs.slide_width
-        slide_height = prs.slide_height
-        content_width = slide_width - 2 * Inches(1.0)  # 内容区域宽度
-        max_content_y = slide_height - Inches(0.5)  # 底部边距
-        available_height = max_content_y - Inches(1.2)  # 可用高度（从题目开始）
-
-        # 解析选项
-        options = self.parse_options(content)
-
-        # 题目内容
-        if options:
-            question_text = content.split('\n')[0]
-        else:
-            question_text = content
-
-        # 计算最佳字体大小
-        fit_params = self.calculate_content_fit(
-            question_text, options, analysis,
-            content_width, available_height
+    def _is_cjk(self, char: str) -> bool:
+        if not char:
+            return False
+        code = ord(char)
+        return (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3040 <= code <= 0x30FF
+            or 0xAC00 <= code <= 0xD7AF
+            or unicodedata.east_asian_width(char) in {"W", "F"}
         )
 
-        q_font_size = fit_params['title_font_size']
-        o_font_size = fit_params['option_font_size']
-        a_font_size = fit_params['analysis_font_size']
-        has_latex_question = fit_params['has_latex_question']
-        has_latex_analysis = fit_params['has_latex_analysis']
+    def _tokenize_text(self, text: str) -> list[str]:
+        tokens: list[str] = []
+        buffer: list[str] = []
 
-        if not fit_params['fits']:
-            print(f"警告：第 {question_num} 题内容较长，已自动缩小字体至 {q_font_size}pt")
+        def flush() -> None:
+            if buffer:
+                tokens.append("".join(buffer))
+                buffer.clear()
 
-        # 标题
-        title_box = slide.shapes.add_textbox(Inches(0), Inches(0.2), slide_width, Inches(0.8))
-        p = title_box.text_frame.paragraphs[0]
-        p.text = f"第 {question_num} 题"
-        p.font.size = Pt(28)
-        p.font.bold = True
-        p.font.name = 'Microsoft YaHei'
-        p.font.color.rgb = RGBColor(0, 112, 192)
-        p.alignment = PP_ALIGN.CENTER
+        for char in text:
+            if char.isspace():
+                flush()
+                tokens.append(char)
+                continue
 
-        current_y = Inches(1.2)
+            if self._is_cjk(char) or char in "，。；：！？、（）()【】[]<>《》“”‘’+-=*/,.:":
+                flush()
+                tokens.append(char)
+                continue
 
-        # 题目内容
-        q_height = self.estimate_text_height(question_text, content_width, q_font_size)
-        if options:
-            q_height = min(q_height, Inches(1.5))
+            buffer.append(char)
+
+        flush()
+        return tokens
+
+    def _resolve_font_path(self, bold: bool) -> str | None:
+        candidates = [
+            Path(r"C:\Windows\Fonts\msyhbd.ttc" if bold else r"C:\Windows\Fonts\msyh.ttc"),
+            Path(r"C:\Windows\Fonts\simhei.ttf" if bold else r"C:\Windows\Fonts\simsun.ttc"),
+            Path(r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        preferred = "Microsoft YaHei"
+        try:
+            return font_manager.findfont(preferred, fallback_to_default=True)
+        except Exception:
+            return None
+
+    @lru_cache(maxsize=128)
+    def _get_pil_font(self, font_size: int, bold: bool) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        px_size = max(int(round(font_size * PIL_DPI / 72)), 1)
+        font_path = self._resolve_font_path(bold)
+        if font_path:
+            try:
+                return ImageFont.truetype(font_path, px_size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    def _text_metrics(self, text: str, font_size: int, bold: bool = False) -> tuple[float, float]:
+        font = self._get_pil_font(font_size, bold)
+        bbox = font.getbbox(text or " ")
+        width_px = max(bbox[2] - bbox[0], 1)
+        height_px = max(bbox[3] - bbox[1], 1)
+        return width_px / PIL_DPI, height_px / PIL_DPI
+
+    def _text_line_height(self, font_size: int, bold: bool = False) -> float:
+        _, height = self._text_metrics("国Ay", font_size, bold)
+        return max(height * 1.08, font_size * 1.08 / 72)
+
+    def _to_px(self, inches: float) -> int:
+        return max(int(round(inches * PIL_DPI)), 1)
+
+    def _color_to_rgba(self, color: tuple[int, int, int], alpha: int = 255) -> tuple[int, int, int, int]:
+        return (color[0], color[1], color[2], alpha)
+
+    def _resample_filter(self):
+        if hasattr(Image, "Resampling"):
+            return Image.Resampling.LANCZOS
+        return Image.LANCZOS
+
+    @lru_cache(maxsize=2048)
+    def _formula_metrics(self, formula: str, font_size: int) -> tuple[str, float, float]:
+        render_size = max(int(round(font_size * 0.85)), 11)
+        image_path = latex_renderer.render_to_image(formula, font_size=render_size)
+        with Image.open(image_path) as image:
+            width_px, height_px = image.size
+
+        text_line_height = self._text_line_height(font_size, False)
+        target_height = max(min(text_line_height * 0.82, font_size * 0.88 / 72), 0.14)
+        aspect_ratio = width_px / max(height_px, 1)
+        target_width = max(target_height * aspect_ratio, 0.14)
+        return image_path, target_width, target_height
+
+    def _new_line(self, font_size: int, bold: bool = False) -> LineLayout:
+        return LineLayout(items=[], width=0.0, height=self._text_line_height(font_size, bold))
+
+    def _append_text_token(
+        self,
+        lines: list[LineLayout],
+        current_line: LineLayout,
+        token: str,
+        max_width: float,
+        font_size: int,
+        bold: bool,
+    ) -> LineLayout:
+        if token.isspace() and not current_line.items:
+            return current_line
+
+        token_width, token_height = self._text_metrics(token, font_size, bold)
+
+        if token.strip() and current_line.items and current_line.width + token_width > max_width:
+            lines.append(current_line)
+            current_line = self._new_line(font_size, bold)
+
+        if token.isspace() and not current_line.items:
+            return current_line
+
+        if current_line.items and current_line.items[-1].kind == "text":
+            current_line.items[-1].content += token
+            current_line.items[-1].width += token_width
+            current_line.items[-1].height = max(current_line.items[-1].height, token_height)
         else:
-            q_height = min(q_height, Inches(3.5))
+            current_line.items.append(
+                InlineItem(kind="text", content=token, width=token_width, height=token_height)
+            )
 
-        q_box = slide.shapes.add_textbox(Inches(1.0), current_y, content_width, q_height)
-        q_box.text_frame.word_wrap = True
-        q_box.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        p = q_box.text_frame.paragraphs[0]
-        self.add_math_text(p, question_text)
-        p.font.size = Pt(q_font_size)
-        p.font.bold = True
-        p.alignment = PP_ALIGN.LEFT
-        p.space_after = Pt(14)
+        current_line.width += token_width
+        current_line.height = max(current_line.height, token_height, self._text_line_height(font_size, bold))
+        return current_line
 
-        current_y += q_height + Inches(0.2)
+    def _append_formula(
+        self,
+        lines: list[LineLayout],
+        current_line: LineLayout,
+        formula: str,
+        max_width: float,
+        font_size: int,
+    ) -> LineLayout:
+        image_path, formula_width, formula_height = self._formula_metrics(formula, font_size)
 
-        # 选项（如果存在）
-        if options:
-            option_y = current_y + Inches(0.1)
-            # 根据选项数量调整高度
-            num_options = len(options)
-            option_height = Inches(0.45 * ((num_options + 1) // 2))
-            o_box = slide.shapes.add_textbox(Inches(1.5), option_y, content_width - Inches(0.5), option_height)
-            o_box.text_frame.word_wrap = True
-            o_box.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        if current_line.items and current_line.width + formula_width > max_width:
+            lines.append(current_line)
+            current_line = self._new_line(font_size)
 
-            for i in range(0, len(options), 2):
-                if i == 0:
-                    p = o_box.text_frame.paragraphs[0]
+        if formula_width > max_width:
+            scale = max_width / formula_width
+            formula_width = max_width
+            formula_height *= scale
+
+        current_line.items.append(
+            InlineItem(
+                kind="formula",
+                content=formula,
+                width=formula_width,
+                height=formula_height,
+                image_path=image_path,
+            )
+        )
+        current_line.width += formula_width
+        current_line.height = max(current_line.height, formula_height)
+        return current_line
+
+    def build_rich_lines(self, text: str, max_width: float, font_size: int, bold: bool = False) -> list[LineLayout]:
+        normalized = self._normalize_text(text)
+        raw_lines = normalized.split("\n") if normalized else [""]
+        layouts: list[LineLayout] = []
+
+        for raw_line in raw_lines:
+            current_line = self._new_line(font_size, bold)
+
+            if not raw_line:
+                current_line.height = self._text_line_height(font_size, bold) * 0.8
+                layouts.append(current_line)
+                continue
+
+            for segment_type, segment_content in self.split_inline_segments(raw_line):
+                if segment_type == "text":
+                    for token in self._tokenize_text(segment_content):
+                        current_line = self._append_text_token(
+                            layouts, current_line, token, max_width, font_size, bold
+                        )
                 else:
-                    p = o_box.text_frame.add_paragraph()
+                    current_line = self._append_formula(
+                        layouts, current_line, segment_content, max_width, font_size
+                    )
 
-                p.alignment = PP_ALIGN.LEFT
-                p.space_after = Pt(12)
-                pPr = p._p.get_or_add_pPr()
-                tab = etree.SubElement(pPr, qn('a:tab'))
-                tab.set('val', '7620')
+            layouts.append(current_line)
 
-                opt1_letter, opt1_text = options[i]
-                self.add_math_text(p, f"{opt1_letter}) {opt1_text}")
+        return layouts
 
-                if i + 1 < len(options):
-                    opt2_letter, opt2_text = options[i+1]
-                    spacing_run = p.add_run()
-                    spacing_run.text = "\t"
-                    self.add_math_text(p, f"{opt2_letter}) {opt2_text}")
+    def estimate_rich_block_height(
+        self,
+        text: str,
+        max_width: float,
+        font_size: int,
+        bold: bool = False,
+        line_gap: float = 0.03,
+    ) -> float:
+        lines = self.build_rich_lines(text, max_width, font_size, bold)
+        if not lines:
+            return 0.0
+        return sum(line.height for line in lines) + max(len(lines) - 1, 0) * line_gap
 
-                for run in p.runs:
-                    run.font.size = Pt(o_font_size)
+    def _add_text_shape(
+        self,
+        slide,
+        text: str,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        font_size: int,
+        color: tuple[int, int, int],
+        bold: bool = False,
+        align: PP_ALIGN = PP_ALIGN.LEFT,
+    ) -> None:
+        shape = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(max(width, 0.2)), Inches(max(height, 0.2)))
+        shape.fill.background()
+        shape.line.fill.background()
 
-            current_y = option_y + option_height + Inches(0.1)
+        text_frame = shape.text_frame
+        text_frame.clear()
+        text_frame.word_wrap = False
+        text_frame.margin_left = 0
+        text_frame.margin_right = 0
+        text_frame.margin_top = 0
+        text_frame.margin_bottom = 0
 
-        # 计算答案和解析区域的位置
-        min_answer_y = Inches(4.0)
-        a_y_pos = max(current_y + Inches(0.2), min_answer_y)
+        paragraph = text_frame.paragraphs[0]
+        paragraph.alignment = align
+        run = paragraph.add_run()
+        run.text = text
+        run.font.size = Pt(font_size)
+        run.font.bold = bold
+        run.font.name = "Microsoft YaHei"
+        run.font.color.rgb = RGBColor(*color)
 
-        # 确保答案区域不会超出边界
-        remaining_space = max_content_y - a_y_pos
-        if remaining_space < Inches(1.0):
-            # 空间严重不足，强制调整位置
-            a_y_pos = max_content_y - Inches(1.5)
-            print(f"警告：第 {question_num} 题解析区域空间不足，已调整位置")
+    @lru_cache(maxsize=2048)
+    def _render_rich_block_image(
+        self,
+        text: str,
+        width: float,
+        font_size: int,
+        color: tuple[int, int, int],
+        bold: bool,
+        line_gap: float,
+    ) -> BlockRender:
+        lines = self.build_rich_lines(text, width, font_size, bold)
+        if not lines:
+            empty_path = self.block_cache_dir / "empty_block.png"
+            if not empty_path.exists():
+                Image.new("RGBA", (2, 2), (255, 255, 255, 0)).save(empty_path)
+            return BlockRender(path=str(empty_path), width=0.02, height=0.02)
 
-        # 答案
-        answer_height = Inches(0.4)
-        answer_box = slide.shapes.add_textbox(Inches(1.0), a_y_pos, content_width, answer_height)
-        answer_box.name = "AnimatedAnswerShape"
-        answer_box.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        ap = answer_box.text_frame.paragraphs[0]
-        ap.text = f"【正确答案】 {answer}"
-        ap.font.size = Pt(20)
-        ap.font.bold = True
-        ap.font.color.rgb = RGBColor(0, 150, 0)
-        ap.alignment = PP_ALIGN.LEFT
+        horizontal_padding = 0.015
+        vertical_padding = 0.015
+        content_height = sum(line.height for line in lines) + max(len(lines) - 1, 0) * line_gap
+        content_width = max((max((line.width for line in lines), default=0.0)), 0.2)
+        image_width_inches = max(content_width + horizontal_padding * 2, 0.2)
+        image_height_inches = max(content_height + vertical_padding * 2, 0.2)
 
-        # 解析
-        analysis_y = a_y_pos + answer_height + Inches(0.1)
-        analysis_available_height = max_content_y - analysis_y
-        if analysis_available_height < Inches(0.5):
-            analysis_y = max_content_y - Inches(1.0)
-            analysis_available_height = Inches(0.9)
+        image = Image.new(
+            "RGBA",
+            (self._to_px(image_width_inches), self._to_px(image_height_inches)),
+            (255, 255, 255, 0),
+        )
+        draw = ImageDraw.Draw(image)
+        font = self._get_pil_font(font_size, bold)
+        resample_filter = self._resample_filter()
+        cursor_y = vertical_padding
 
-        analysis_height = self.estimate_text_height('【解析】 ' + analysis, content_width, a_font_size)
-        analysis_height = min(analysis_height, analysis_available_height)
+        for line in lines:
+            cursor_x = horizontal_padding
+            if not line.items:
+                cursor_y += line.height + line_gap
+                continue
 
-        analysis_box = slide.shapes.add_textbox(Inches(1.0), analysis_y, content_width, analysis_height)
-        analysis_box.text_frame.word_wrap = True
-        analysis_box.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        p2 = analysis_box.text_frame.paragraphs[0]
+            for item in line.items:
+                if item.kind == "text":
+                    token_y = cursor_y + max((line.height - item.height) / 2, 0)
+                    draw.text(
+                        (self._to_px(cursor_x), self._to_px(token_y)),
+                        item.content,
+                        font=font,
+                        fill=self._color_to_rgba(color),
+                    )
+                else:
+                    token_y = cursor_y + max((line.height - item.height) / 2, 0)
+                    with Image.open(item.image_path).convert("RGBA") as formula_image:
+                        formula_image = formula_image.resize(
+                            (self._to_px(item.width), self._to_px(item.height)),
+                            resample=resample_filter,
+                        )
+                        image.alpha_composite(formula_image, (self._to_px(cursor_x), self._to_px(token_y)))
 
-        run = p2.add_run()
-        run.text = "【解析】 "
-        run.font.bold = True
-        run.font.size = Pt(a_font_size)
-        run.font.color.rgb = RGBColor(100, 100, 100)
+                cursor_x += item.width
 
-        self.add_math_text(p2, analysis)
+            cursor_y += line.height + line_gap
 
-        for run in p2.runs:
-            if not run.font.size:
-                run.font.size = Pt(a_font_size)
+        cache_key = f"{BLOCK_CACHE_VERSION}|{text}|{width:.3f}|{font_size}|{color}|{bold}|{line_gap:.3f}"
+        cache_name = f"block_{hashlib.md5(cache_key.encode('utf-8')).hexdigest()}.png"
+        output_path = self.block_cache_dir / cache_name
+        if not output_path.exists():
+            image.save(output_path)
 
-    def add_animations_via_com(self, pptx_path: Path):
+        return BlockRender(
+            path=str(output_path),
+            width=content_width + horizontal_padding * 2,
+            height=content_height + vertical_padding * 2,
+        )
+
+    def draw_rich_block(
+        self,
+        slide,
+        text: str,
+        x: float,
+        y: float,
+        width: float,
+        font_size: int,
+        color: tuple[int, int, int] = COLOR_TEXT,
+        bold: bool = False,
+        line_gap: float = 0.03,
+    ) -> float:
+        block = self._render_rich_block_image(text, width, font_size, color, bold, line_gap)
+        slide.shapes.add_picture(
+            block.path,
+            Inches(x),
+            Inches(y),
+            width=Inches(block.width),
+            height=Inches(block.height),
+        )
+        return y + block.height
+
+    def estimate_labeled_block_height(
+        self,
+        label: str,
+        text: str,
+        width: float,
+        label_font_size: int,
+        text_font_size: int,
+        line_gap: float = 0.03,
+    ) -> float:
+        label_width, _ = self._text_metrics(label, label_font_size, True)
+        value_width = max(width - label_width - 0.06, 1.0)
+        value_height = self.estimate_rich_block_height(text, value_width, text_font_size, False, line_gap)
+        return max(self._text_line_height(label_font_size, True), value_height)
+
+    def draw_labeled_block(
+        self,
+        slide,
+        label: str,
+        text: str,
+        x: float,
+        y: float,
+        width: float,
+        label_font_size: int,
+        text_font_size: int,
+        label_color: tuple[int, int, int],
+        text_color: tuple[int, int, int] = COLOR_TEXT,
+        line_gap: float = 0.03,
+    ) -> float:
+        label_width, _ = self._text_metrics(label, label_font_size, True)
+        label_height = self._text_line_height(label_font_size, True)
+        self._add_text_shape(
+            slide=slide,
+            text=label,
+            x=x,
+            y=y,
+            width=label_width + 0.04,
+            height=label_height,
+            font_size=label_font_size,
+            color=label_color,
+            bold=True,
+        )
+
+        value_x = x + label_width + 0.06
+        value_width = max(width - label_width - 0.06, 1.0)
+        value_bottom = self.draw_rich_block(
+            slide=slide,
+            text=text,
+            x=value_x,
+            y=y,
+            width=value_width,
+            font_size=text_font_size,
+            color=text_color,
+            bold=False,
+            line_gap=line_gap,
+        )
+        return max(y + label_height, value_bottom)
+
+    def split_question_content(self, content: str) -> tuple[str, list[tuple[str, str]]]:
+        normalized = self._normalize_text(content)
+        if not normalized:
+            return "", []
+
+        stem_lines: list[str] = []
+        options: list[tuple[str, str]] = []
+        current_option_letter: str | None = None
+        current_option_lines: list[str] = []
+
+        def flush_option() -> None:
+            nonlocal current_option_letter, current_option_lines
+            if current_option_letter is not None:
+                option_text = "\n".join(line for line in current_option_lines if line is not None).strip()
+                options.append((current_option_letter, option_text))
+            current_option_letter = None
+            current_option_lines = []
+
+        for line in normalized.split("\n"):
+            match = OPTION_PATTERN.match(line)
+            if match:
+                flush_option()
+                current_option_letter = match.group(1)
+                current_option_lines = [match.group(2).strip()]
+                continue
+
+            if current_option_letter is not None:
+                current_option_lines.append(line.strip())
+            else:
+                stem_lines.append(line)
+
+        flush_option()
+        return "\n".join(stem_lines).strip(), options
+
+    def _format_stem_for_display(self, text: str) -> str:
+        text = self._normalize_text(text)
+        if not text:
+            return text
+
+        replacements = [
+            ("，且", "，\n且"),
+            ("，则", "，\n则"),
+            ("。则", "。\n则"),
+            ("；", "；\n"),
+        ]
+        for source, target in replacements:
+            text = text.replace(source, target)
+
+        text = re.sub(r"(?<!\n)(\(\d+\)|（\d+）)", r"\n\1", text)
+        text = re.sub(r"\n{2,}", "\n", text)
+        return text.strip()
+
+    def _format_analysis_for_display(self, text: str) -> str:
+        text = self._normalize_text(text)
+        if not text:
+            return text
+
+        text = re.sub(r"(?<!\n)(\(\d+\)|（\d+）)", r"\n\1", text)
+        text = text.replace("。", "。\n")
+        text = text.replace("；", "；\n")
+        text = re.sub(r"\n{2,}", "\n", text)
+        return text.strip()
+
+    def choose_font_profile(
+        self,
+        stem: str,
+        options: list[tuple[str, str]],
+        answer: str,
+        analysis: str,
+        width: float,
+        available_height: float,
+    ) -> FontProfile:
+        candidates = [
+            FontProfile(stem=18, option=15, answer=15, analysis=13),
+            FontProfile(stem=17, option=14, answer=14, analysis=12),
+            FontProfile(stem=16, option=13, answer=13, analysis=11),
+            FontProfile(stem=15, option=12, answer=12, analysis=10),
+            FontProfile(stem=14, option=11, answer=11, analysis=10),
+        ]
+
+        for profile in candidates:
+            total_height = 0.0
+
+            if stem:
+                total_height += self.estimate_rich_block_height(stem, width, profile.stem, False, 0.025)
+                total_height += 0.06
+
+            if options:
+                for letter, option_text in options:
+                    total_height += self.estimate_labeled_block_height(
+                        label=f"{letter}.",
+                        text=option_text,
+                        width=width - 0.1,
+                        label_font_size=profile.option,
+                        text_font_size=profile.option,
+                        line_gap=0.025,
+                    )
+                    total_height += 0.04
+
+            total_height += self.estimate_labeled_block_height(
+                label="【答案】",
+                text=answer,
+                width=width,
+                label_font_size=profile.answer,
+                text_font_size=profile.answer,
+                line_gap=0.025,
+            )
+            total_height += 0.06
+
+            total_height += self.estimate_labeled_block_height(
+                label="【解析】",
+                text=analysis,
+                width=width,
+                label_font_size=profile.analysis,
+                text_font_size=profile.analysis,
+                line_gap=0.025,
+            )
+
+            if total_height <= available_height:
+                return profile
+
+        return candidates[-1]
+
+    def create_title_slide(self, prs: Presentation, main_title: str, subtitle_text: str) -> None:
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+        self._add_text_shape(
+            slide=slide,
+            text=main_title or "试卷讲解",
+            x=0.8,
+            y=2.15,
+            width=self.slide_width_inches - 1.6,
+            height=0.7,
+            font_size=24,
+            color=COLOR_TITLE,
+            bold=True,
+            align=PP_ALIGN.CENTER,
+        )
+        self._add_text_shape(
+            slide=slide,
+            text=subtitle_text,
+            x=0.8,
+            y=3.0,
+            width=self.slide_width_inches - 1.6,
+            height=0.35,
+            font_size=12,
+            color=COLOR_MUTED,
+            bold=False,
+            align=PP_ALIGN.CENTER,
+        )
+
+    def create_question_slide(
+        self,
+        prs: Presentation,
+        question_num: int,
+        content: str,
+        source: str,
+        answer: str,
+        analysis: str,
+    ) -> None:
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+        stem, options = self.split_question_content(content)
+        stem = self._format_stem_for_display(stem)
+        options = [(letter, self._format_stem_for_display(option_text)) for letter, option_text in options]
+        answer = self._normalize_text(answer)
+        analysis = self._format_analysis_for_display(analysis)
+        source = self._normalize_text(source)
+        body_width = min(self.content_width, 6.8)
+        option_width = body_width - 0.15
+
+        header_top = 0.16
+        current_y = 0.26
+
+        self._add_text_shape(
+            slide=slide,
+            text=f"第 {question_num} 题",
+            x=0.8,
+            y=header_top,
+            width=self.slide_width_inches - 1.6,
+            height=0.38,
+            font_size=20,
+            color=COLOR_TITLE,
+            bold=True,
+            align=PP_ALIGN.CENTER,
+        )
+
+        current_y = 0.62
+        if source:
+            self._add_text_shape(
+                slide=slide,
+                text=f"来源：{source}",
+                x=0.72,
+                y=current_y,
+                width=body_width,
+                height=0.2,
+                font_size=9,
+                color=COLOR_MUTED,
+                bold=False,
+                align=PP_ALIGN.LEFT,
+            )
+            current_y += 0.24
+
+        available_height = self.slide_height_inches - current_y - 0.22
+        profile = self.choose_font_profile(
+            stem=stem,
+            options=options,
+            answer=answer,
+            analysis=analysis,
+            width=body_width,
+            available_height=available_height,
+        )
+
+        if stem:
+            current_y = self.draw_rich_block(
+                slide=slide,
+                text=stem,
+                x=self.page_left,
+                y=current_y,
+                width=body_width,
+                font_size=profile.stem,
+                color=COLOR_TEXT,
+                bold=False,
+                line_gap=0.025,
+            )
+            current_y += 0.05
+
+        for letter, option_text in options:
+            current_y = self.draw_labeled_block(
+                slide=slide,
+                label=f"{letter}.",
+                text=option_text,
+                x=self.page_left + 0.1,
+                y=current_y,
+                width=option_width,
+                label_font_size=profile.option,
+                text_font_size=profile.option,
+                label_color=COLOR_TEXT,
+                text_color=COLOR_TEXT,
+                line_gap=0.025,
+            )
+            current_y += 0.03
+
+        current_y += 0.01
+        current_y = self.draw_labeled_block(
+            slide=slide,
+            label="【答案】",
+            text=answer or "未提供",
+            x=self.page_left,
+            y=current_y,
+            width=body_width,
+            label_font_size=profile.answer,
+            text_font_size=profile.answer,
+            label_color=COLOR_ANSWER,
+            text_color=COLOR_ANSWER,
+            line_gap=0.025,
+        )
+
+        current_y += 0.04
+        self.draw_labeled_block(
+            slide=slide,
+            label="【解析】",
+            text=analysis or "未提供解析。",
+            x=self.page_left,
+            y=current_y,
+            width=body_width,
+            label_font_size=profile.analysis,
+            text_font_size=profile.analysis,
+            label_color=COLOR_MUTED,
+            text_color=COLOR_TEXT,
+            line_gap=0.025,
+        )
+
+    def add_animations_via_com(self, pptx_path: Path) -> bool:
         if not HAS_WIN32COM:
-            print("未安装 pywin32，跳过添加动画步骤。")
             return False
 
+        app = None
+        prs = None
         try:
             app = win32com.client.Dispatch("PowerPoint.Application")
-            abs_path = os.path.abspath(str(pptx_path))
-            prs = app.Presentations.Open(abs_path, WithWindow=False)
+            prs = app.Presentations.Open(os.path.abspath(str(pptx_path)), WithWindow=False)
 
             for slide in prs.Slides:
                 for shape in slide.Shapes:
@@ -499,40 +802,50 @@ class PPTGenerator:
                         slide.TimeLine.MainSequence.AddEffect(shape, 10, 0, 1)
 
             prs.Save()
-            prs.Close()
-            app.Quit()
             return True
-        except Exception as e:
-            print(f"添加动画时出现异常: {e}")
-            try:
-                app.Quit()
-            except:
-                pass
+        except Exception:
             return False
+        finally:
+            try:
+                if prs is not None:
+                    prs.Close()
+            except Exception:
+                pass
+            try:
+                if app is not None:
+                    app.Quit()
+            except Exception:
+                pass
 
-    def generate(self, questions: list, output_path: Path, title: str = None, use_animation: bool = True) -> Path:
+    def generate(
+        self,
+        questions: list,
+        output_path: Path,
+        title: str | None = None,
+        use_animation: bool = True,
+    ) -> Path:
         prs = Presentation()
-        prs.slide_width = Inches(13.333)
-        prs.slide_height = Inches(7.5)
-
-        subtitle_text = f"共 {len(questions)} 道题目"
+        prs.slide_width = Inches(self.slide_width_inches)
+        prs.slide_height = Inches(self.slide_height_inches)
 
         if title:
             main_title = title
-        elif questions and questions[0].get('source'):
-            main_title = questions[0]['source']
+        elif questions and questions[0].get("source"):
+            main_title = str(questions[0]["source"])
         else:
-            main_title = "试卷评讲"
+            main_title = "试卷讲解"
 
+        subtitle_text = f"共 {len(questions)} 道题目"
         self.create_title_slide(prs, main_title, subtitle_text)
 
-        for idx, q in enumerate(questions, 1):
+        for idx, question in enumerate(questions, 1):
             self.create_question_slide(
-                prs, idx,
-                q.get('content', ''),
-                q.get('source', ''),
-                q.get('answer', ''),
-                q.get('analysis', '')
+                prs=prs,
+                question_num=idx,
+                content=str(question.get("content", "")),
+                source=str(question.get("source", "")),
+                answer=str(question.get("answer", "")),
+                analysis=str(question.get("analysis", "")),
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)

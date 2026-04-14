@@ -61,13 +61,15 @@ async def get_fix_result(task_id: str):
     if task.result_file:
         json_content = storage.load_json(Path(task.result_file))
 
+    payload = task.data if task.data else json_content
+
     return DeepSeekResultResponse(
         task_id=task_id,
         status=task.status.value,
         result_file=task.result_file,
         questions_count=len(json_content) if isinstance(json_content, list) else 0,
         json_content=json_content,
-        data=json_content
+        data=payload
     )
 
 @router.post("/batch-fix")
